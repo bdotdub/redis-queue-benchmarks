@@ -1,0 +1,13 @@
+zset-max-ziplist-entries:  35000
+====================
+List with Zset
+Added	999990	1m14.972136307s
+Popped	999990	37.636811909s
+Memory: 214.58M
+
+====================
+Just Zset
+Added	999990	38.866093668s
+Popped	999990	1m20.26998516s
+Memory: 273.44M
+
