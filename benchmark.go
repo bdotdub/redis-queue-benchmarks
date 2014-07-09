@@ -42,7 +42,6 @@ func msgs() *[]Msgs {
 func justZset(r redis.Conn, ms *[]Msgs) {
 	tAdd := time.Now()
 	for _, m := range *ms {
-		fmt.Println("Adding for", m.t)
 		for _, s := range m.msgs {
 			r.Do("ZADD", "apns:push:delayed", fmt.Sprint(m.t.Unix()), s)
 		}
@@ -51,7 +50,6 @@ func justZset(r redis.Conn, ms *[]Msgs) {
 
 	tPop := time.Now()
 	for _, m := range *ms {
-		fmt.Println("Popping for", m.t)
 		for {
 			m, _ := redis.Strings(r.Do("zrangebyscore", "apns:push:delayed", "-inf", fmt.Sprint(m.t.Unix()), "limit", 0, 1))
 
@@ -60,6 +58,41 @@ func justZset(r redis.Conn, ms *[]Msgs) {
 			}
 
 			redis.Bool(r.Do("zrem", "apns:push:delayed", m[0]))
+		}
+	}
+	fmt.Println("Popping", time.Since(tPop))
+}
+
+func listWithZset(r redis.Conn, ms *[]Msgs) {
+	tAdd := time.Now()
+	for _, m := range *ms {
+		for _, s := range m.msgs {
+			if len(s) == 0 {
+			}
+			// r.Do("ZADD", "apns:push:delayed", fmt.Sprint(m.t.Unix()), fmt.Sprint(m.t.Unix()))
+			// r.Do("RPUSH", fmt.Sprintf("apns:push:delayed:%v", m.t.Unix()), s)
+		}
+	}
+	fmt.Println("Adding", time.Since(tAdd))
+
+	tPop := time.Now()
+	for _, _ = range *ms {
+		for {
+			m, _ := redis.Strings(r.Do("zrangebyscore", "apns:push:delayed", "-inf", "+inf", "limit", 0, 1))
+
+			if len(m) == 0 {
+				break
+			}
+
+			redis.Bool(r.Do("zrem", "apns:push:delayed", m[0]))
+
+			for {
+				mm, _ := redis.Strings(r.Do("LPOP", fmt.Sprintf("apns:push:delayed:%v", m[0])))
+				fmt.Println(mm)
+				if len(mm) == 0 {
+					break
+				}
+			}
 		}
 	}
 	fmt.Println("Popping", time.Since(tPop))
@@ -76,5 +109,6 @@ func main() {
 
 	ms := msgs()
 
-	justZset(r, ms)
+	listWithZset(r, ms)
+	// justZset(r, ms)
 }
