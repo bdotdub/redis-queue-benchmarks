@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
@@ -10,11 +11,20 @@ import (
 
 const (
 	apnsJSONTemplate = `{"token":"%10d9999999999999999%5d999999999999999999999999999999999","badge":1,content_available:0,"body":"Your Timehop day is ready!\nView it now →"}`
+	benchmarkRedisDB = "15"
 )
 
 type Msgs struct {
 	msgs []string
 	t    time.Time
+}
+
+type Result struct {
+	Add         time.Duration
+	AddedItems  int
+	Pop         time.Duration
+	PoppedItems int
+	Memory      string
 }
 
 func msgs() *[]Msgs {
@@ -24,7 +34,7 @@ func msgs() *[]Msgs {
 	t := time.Date(2014, 1, 17, 4, 0, 0, 0, tz)
 
 	for hr := 0; hr < 1; hr++ {
-		for min := 15; min <= 45; min++ {
+		for min := 15; min < 45; min++ {
 			nt := t.Add(time.Duration(hr) * time.Hour).Add(time.Duration(min) * time.Minute)
 
 			msgs := make([]string, 33333)
@@ -39,14 +49,35 @@ func msgs() *[]Msgs {
 	return &ms
 }
 
-func justZset(r redis.Conn, ms *[]Msgs) {
+func memoryHuman(r redis.Conn) string {
+	s, _ := redis.String(r.Do("INFO", "memory"))
+	for _, l := range strings.Split(s, "\n") {
+		if strings.HasPrefix(l, "used_memory_human") {
+			parts := strings.Split(l, ":")
+			return parts[1]
+		}
+	}
+
+	return ""
+}
+
+func config(r redis.Conn, c string) string {
+	s, _ := redis.Strings(r.Do("config", "get", c))
+	return s[1]
+}
+
+func justZset(r redis.Conn, ms *[]Msgs) Result {
+	res := Result{}
+
 	tAdd := time.Now()
 	for _, m := range *ms {
 		for _, s := range m.msgs {
 			r.Do("ZADD", "apns:push:delayed", fmt.Sprint(m.t.Unix()), s)
+			res.AddedItems += 1
 		}
 	}
-	fmt.Println("Adding", time.Since(tAdd))
+	res.Add = time.Since(tAdd)
+	res.Memory = memoryHuman(r)
 
 	tPop := time.Now()
 	for _, m := range *ms {
@@ -58,44 +89,56 @@ func justZset(r redis.Conn, ms *[]Msgs) {
 			}
 
 			redis.Bool(r.Do("zrem", "apns:push:delayed", m[0]))
+			res.PoppedItems += 1
 		}
 	}
-	fmt.Println("Popping", time.Since(tPop))
+
+	res.Pop = time.Since(tPop)
+	return res
 }
 
-func listWithZset(r redis.Conn, ms *[]Msgs) {
+func listWithZset(r redis.Conn, ms *[]Msgs) Result {
+	res := Result{}
+
 	tAdd := time.Now()
 	for _, m := range *ms {
+		r.Do("ZADD", "apns:push:delayed", fmt.Sprint(m.t.Unix()), fmt.Sprint(m.t.Unix()))
 		for _, s := range m.msgs {
-			if len(s) == 0 {
-			}
-			// r.Do("ZADD", "apns:push:delayed", fmt.Sprint(m.t.Unix()), fmt.Sprint(m.t.Unix()))
-			// r.Do("RPUSH", fmt.Sprintf("apns:push:delayed:%v", m.t.Unix()), s)
+			r.Do("ZADD", "apns:push:delayed", fmt.Sprint(m.t.Unix()), fmt.Sprint(m.t.Unix()))
+			r.Do("RPUSH", fmt.Sprintf("apns:push:delayed:%v", m.t.Unix()), s)
+
+			res.AddedItems += 1
 		}
 	}
-	fmt.Println("Adding", time.Since(tAdd))
+
+	res.Add = time.Since(tAdd)
+	res.Memory = memoryHuman(r)
 
 	tPop := time.Now()
-	for _, _ = range *ms {
-		for {
-			m, _ := redis.Strings(r.Do("zrangebyscore", "apns:push:delayed", "-inf", "+inf", "limit", 0, 1))
+	for {
+		v, err := r.Do("zrangebyscore", "apns:push:delayed", "-inf", "+inf", "limit", 0, 1)
 
-			if len(m) == 0 {
+		vs, _ := redis.Values(v, err)
+		if len(vs) == 0 {
+			break
+		}
+
+		bs := vs[0].([]byte)
+		m := string(bs)
+
+		redis.Bool(r.Do("zrem", "apns:push:delayed", m))
+
+		for {
+			mm, _ := redis.String(r.Do("LPOP", fmt.Sprintf("apns:push:delayed:%v", m)))
+			if len(mm) == 0 {
 				break
 			}
-
-			redis.Bool(r.Do("zrem", "apns:push:delayed", m[0]))
-
-			for {
-				mm, _ := redis.Strings(r.Do("LPOP", fmt.Sprintf("apns:push:delayed:%v", m[0])))
-				fmt.Println(mm)
-				if len(mm) == 0 {
-					break
-				}
-			}
+			res.PoppedItems += 1
 		}
 	}
-	fmt.Println("Popping", time.Since(tPop))
+
+	res.Pop = time.Since(tPop)
+	return res
 }
 
 func main() {
@@ -105,10 +148,29 @@ func main() {
 	}
 	defer r.Close()
 
-	r.Do("SELECT", "5")
+	r.Do("SELECT", benchmarkRedisDB)
 
 	ms := msgs()
 
-	listWithZset(r, ms)
-	// justZset(r, ms)
+	fmt.Println("zset-max-ziplist-entries: ", config(r, "zset-max-ziplist-entries"))
+
+	lwz := listWithZset(r, ms)
+
+	fmt.Println("====================")
+	fmt.Println("List with Zset")
+
+	fmt.Printf("Added\t%v\t%v\n", lwz.AddedItems, lwz.Add)
+	fmt.Printf("Popped\t%v\t%v\n", lwz.PoppedItems, lwz.Pop)
+	fmt.Printf("Memory: %v\n\n", lwz.Memory)
+
+	jz := justZset(r, ms)
+
+	fmt.Println("====================")
+	fmt.Println("Just Zset")
+
+	fmt.Printf("Added\t%v\t%v\n", jz.AddedItems, jz.Add)
+	fmt.Printf("Popped\t%v\t%v\n", jz.PoppedItems, jz.Pop)
+	fmt.Printf("Memory: %v\n\n", jz.Memory)
+
+	r.Do("flushall")
 }
